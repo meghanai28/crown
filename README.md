@@ -1,0 +1,1 @@
+Can we learn a low-dimensional coordinate system of a pretrained model’s local task landscape, then use a task description or a few examples to navigate directly toward a specialist—including unseen task combinations?

@@ -1,0 +1,30 @@
+{
+  "task_suite": "crown_atomic_pilot_v2",
+  "layer_index": 14,
+  "rank": 4,
+  "scales_searched": [
+    0.02,
+    0.05,
+    0.1,
+    0.2
+  ],
+  "seeds_per_scale": 2,
+  "math_search_enabled": false,
+  "code_search_enabled": true,
+  "math": {
+    "selected_seed": null,
+    "selected_scale": null,
+    "base_dev_accuracy": 0.875,
+    "selected_dev_accuracy": 0.875,
+    "base_test_accuracy": 0.9375,
+    "selected_test_accuracy": 0.9375
+  },
+  "code": {
+    "selected_seed": null,
+    "selected_scale": null,
+    "base_dev_accuracy": 0.5,
+    "selected_dev_accuracy": 0.5,
+    "base_test_accuracy": 0.375,
+    "selected_test_accuracy": 0.375
+  }
+}
