@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 from model import BaseModel
-from perturb import LocalPerturbation, PerturbationConfig
+from perturb import (
+    DEFAULT_MODULE_PATHS,
+    LocalPerturbation,
+    PerturbationConfig,
+)
 from scoring import (
-    extract_explicit_answer,
-    extract_math_answer,
-    is_correct,
+    ScoreResult,
     normalize_code_value,
+    score_prediction,
 )
 from tasks import (
     CODE_DEV_TASKS,
@@ -21,24 +25,29 @@ from tasks import (
 )
 
 
-# Search settings
-SCALES = (0.02, 0.05, 0.10, 0.20)
-NUM_SEEDS_PER_SCALE = 8
+# One seed defines one direction. Reusing that seed at every scale
+# measures several distances along the same direction.
+DIRECTION_SEEDS = (0, 1, 2, 3)
+SCALES = (0.001, 0.003, 0.01, 0.03)
 
-LAYER_INDEX = 14
+# None asks perturb.py to choose four depth-spanning layers.
+LAYER_INDICES: tuple[int, ...] | None = None
+MODULE_PATHS = DEFAULT_MODULE_PATHS
 RANK = 4
 MAX_TOKENS = 196
 
-# Math is currently 94%, so there is almost no room
-# for a math perturbation to improve.
+# Math already has little headroom. Start by searching the weaker
+# code family, then enable math after the pipeline is validated.
 SEARCH_MATH = False
 SEARCH_CODE = True
 
+RESULTS_PATH = Path("results/selected_specialists.json")
+
 EVALUATION_SYSTEM_PROMPT = (
-    "Solve the task carefully using at most two short "
-    "sentences of reasoning. "
-    "Then put only the final value inside "
-    "<answer> and </answer>."
+    "Solve the task carefully. Keep any reasoning brief. "
+    "Your final line must contain only the final value inside "
+    "<answer> and </answer>. Do not write anything after the "
+    "closing tag."
 )
 
 
@@ -46,25 +55,18 @@ EVALUATION_SYSTEM_PROMPT = (
 class CandidateScore:
     seed: int | None
     scale: float | None
-    correct: int
-    total: int
-    extracted_answers: tuple[str | None, ...]
+    results: tuple[ScoreResult, ...]
     predictions: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.total <= 0:
+        if not self.results:
             raise ValueError(
-                "CandidateScore total must be positive"
+                "CandidateScore needs at least one result"
             )
 
-        if len(self.extracted_answers) != self.total:
+        if len(self.results) != len(self.predictions):
             raise ValueError(
-                "extracted_answers length must equal total"
-            )
-
-        if len(self.predictions) != self.total:
-            raise ValueError(
-                "predictions length must equal total"
+                "results and predictions must have equal length"
             )
 
         if self.seed is None and self.scale is not None:
@@ -74,19 +76,59 @@ class CandidateScore:
 
         if self.seed is not None and self.scale is None:
             raise ValueError(
-                "a perturbed score must have a scale"
+                "a perturbation must have a scale"
             )
 
     @property
-    def accuracy(self) -> float:
-        return self.correct / self.total
+    def total(self) -> int:
+        return len(self.results)
+
+    @property
+    def semantic_correct(self) -> int:
+        return sum(
+            result.semantic_correct
+            for result in self.results
+        )
+
+    @property
+    def value_correct(self) -> int:
+        return sum(
+            result.value_correct
+            for result in self.results
+        )
+
+    @property
+    def strict_correct(self) -> int:
+        return sum(
+            result.strict_correct
+            for result in self.results
+        )
 
     @property
     def parsed(self) -> int:
         return sum(
-            answer is not None
-            for answer in self.extracted_answers
+            result.parsed
+            for result in self.results
         )
+
+    @property
+    def format_valid(self) -> int:
+        return sum(
+            result.format_valid
+            for result in self.results
+        )
+
+    @property
+    def semantic_accuracy(self) -> float:
+        return self.semantic_correct / self.total
+
+    @property
+    def value_accuracy(self) -> float:
+        return self.value_correct / self.total
+
+    @property
+    def strict_accuracy(self) -> float:
+        return self.strict_correct / self.total
 
     @property
     def label(self) -> str:
@@ -94,30 +136,29 @@ class CandidateScore:
             return "base"
 
         return (
-            f"scale {self.scale:.3f}, "
-            f"seed {self.seed}"
+            f"scale {self.scale:g}, "
+            f"direction {self.seed}"
         )
 
 
-def extract_candidate_answer(
-    task: AtomicTask,
+def _prediction_preview(
     prediction: str,
-) -> str | None:
-    if task.family == "math":
-        return extract_math_answer(prediction)
+    limit: int = 260,
+) -> str:
+    one_line = " ".join(prediction.split())
 
-    if task.family == "code":
-        return extract_explicit_answer(prediction)
+    if len(one_line) <= limit:
+        return one_line
 
-    raise ValueError(
-        f"unsupported task family: {task.family!r}"
-    )
+    return one_line[: limit - 3] + "..."
 
 
 def answer_key(
     task: AtomicTask,
-    answer: str | None,
+    result: ScoreResult,
 ) -> tuple[str, str]:
+    answer = result.extracted_answer
+
     if answer is None:
         return "missing", ""
 
@@ -125,7 +166,6 @@ def answer_key(
         return "math", answer
 
     value_type, value = normalize_code_value(answer)
-
     return value_type, repr(value)
 
 
@@ -134,26 +174,28 @@ def count_changed_answers(
     base_score: CandidateScore,
     candidate_score: CandidateScore,
 ) -> int:
-    changed = 0
-
-    for task, base_answer, candidate_answer in zip(
-        tasks,
-        base_score.extracted_answers,
-        candidate_score.extracted_answers,
-    ):
-        base_key = answer_key(
-            task,
-            base_answer,
+    return sum(
+        answer_key(task, base_result)
+        != answer_key(task, candidate_result)
+        for task, base_result, candidate_result in zip(
+            tasks,
+            base_score.results,
+            candidate_score.results,
         )
-        candidate_key = answer_key(
-            task,
-            candidate_answer,
+    )
+
+
+def count_changed_predictions(
+    base_score: CandidateScore,
+    candidate_score: CandidateScore,
+) -> int:
+    return sum(
+        base_prediction != candidate_prediction
+        for base_prediction, candidate_prediction in zip(
+            base_score.predictions,
+            candidate_score.predictions,
         )
-
-        if base_key != candidate_key:
-            changed += 1
-
-    return changed
+    )
 
 
 def print_answer_changes(
@@ -161,34 +203,29 @@ def print_answer_changes(
     base_score: CandidateScore,
     candidate_score: CandidateScore,
 ) -> None:
-    print("\n  Answers changed by selected candidate:")
-
+    print("\n  Extracted answers changed by winner:")
     found_change = False
 
-    for task, base_answer, candidate_answer in zip(
+    for task, base_result, candidate_result in zip(
         tasks,
-        base_score.extracted_answers,
-        candidate_score.extracted_answers,
+        base_score.results,
+        candidate_score.results,
     ):
-        base_key = answer_key(
-            task,
-            base_answer,
-        )
-        candidate_key = answer_key(
-            task,
-            candidate_answer,
-        )
-
-        if base_key == candidate_key:
+        if (
+            answer_key(task, base_result)
+            == answer_key(task, candidate_result)
+        ):
             continue
 
         found_change = True
-
         print(f"    {task.task_id}")
-        print(f"      base: {base_answer!r}")
         print(
-            f"      candidate: "
-            f"{candidate_answer!r}"
+            "      base:      "
+            f"{base_result.extracted_answer!r}"
+        )
+        print(
+            "      candidate: "
+            f"{candidate_result.extracted_answer!r}"
         )
 
     if not found_change:
@@ -203,9 +240,8 @@ def evaluate_current_model(
     scale: float | None,
     show_details: bool,
 ) -> CandidateScore:
-    correct = 0
     predictions: list[str] = []
-    extracted_answers: list[str | None] = []
+    results: list[ScoreResult] = []
 
     for task in tasks:
         prediction = model.generate(
@@ -213,58 +249,56 @@ def evaluate_current_model(
             system_prompt=EVALUATION_SYSTEM_PROMPT,
             max_tokens=MAX_TOKENS,
         )
-
-        extracted_answer = extract_candidate_answer(
-            task,
-            prediction,
-        )
-
-        prediction_matches = is_correct(
+        result = score_prediction(
             family=task.family,
             expected=task.expected_answer,
             prediction=prediction,
         )
 
         predictions.append(prediction)
-        extracted_answers.append(extracted_answer)
-
-        if prediction_matches:
-            correct += 1
+        results.append(result)
 
         if show_details:
             status = (
                 "PASS"
-                if prediction_matches
+                if result.semantic_correct
                 else "FAIL"
+            )
+            strict_status = (
+                "yes"
+                if result.strict_correct
+                else "no"
             )
 
             print(f"    {task.task_id}: {status}")
             print(
-                f"      expected: "
+                f"      expected:  "
                 f"{task.expected_answer!r}"
             )
             print(
                 f"      extracted: "
-                f"{extracted_answer!r}"
+                f"{result.extracted_answer!r}"
+            )
+            print(
+                f"      source: {result.source}; "
+                f"strict: {strict_status}"
             )
 
-            if extracted_answer is None:
+            if not result.semantic_correct:
                 print(
-                    f"      raw prediction: "
-                    f"{prediction!r}"
+                    "      raw: "
+                    f"{_prediction_preview(prediction)!r}"
                 )
 
     return CandidateScore(
         seed=seed,
         scale=scale,
-        correct=correct,
-        total=len(tasks),
-        extracted_answers=tuple(extracted_answers),
+        results=tuple(results),
         predictions=tuple(predictions),
     )
 
 
-def evaluate_seed(
+def evaluate_direction(
     model: BaseModel,
     tasks: tuple[AtomicTask, ...],
     *,
@@ -272,12 +306,12 @@ def evaluate_seed(
     scale: float,
 ) -> CandidateScore:
     config = PerturbationConfig(
-        layer_index=LAYER_INDEX,
+        layer_indices=LAYER_INDICES,
+        module_paths=MODULE_PATHS,
         rank=RANK,
         scale=scale,
         seed=seed,
     )
-
     perturbation = LocalPerturbation(
         model,
         config,
@@ -296,21 +330,58 @@ def evaluate_seed(
 def print_score(
     score: CandidateScore,
     *,
-    changed: int | None = None,
+    answer_changes: int | None = None,
+    text_changes: int | None = None,
 ) -> None:
     message = (
         f"  {score.label}: "
-        f"{score.correct}/{score.total} "
-        f"({score.accuracy:.1%}), "
-        f"parsed {score.parsed}/{score.total}"
+        f"semantic {score.semantic_correct}/{score.total} "
+        f"({score.semantic_accuracy:.1%}), "
+        f"value {score.value_correct}/{score.total}, "
+        f"strict {score.strict_correct}/{score.total}, "
+        f"tags {score.format_valid}/{score.total}"
     )
 
-    if changed is not None:
+    if answer_changes is not None:
         message += (
-            f", changed {changed}/{score.total}"
+            f", answer changes "
+            f"{answer_changes}/{score.total}"
+        )
+
+    if text_changes is not None:
+        message += (
+            f", text changes "
+            f"{text_changes}/{score.total}"
         )
 
     print(message)
+
+
+def _candidate_is_better(
+    candidate: CandidateScore,
+    best: CandidateScore,
+) -> bool:
+    # A perturbation must add semantic task capability. Better
+    # formatting alone is not enough to call it a specialist.
+    if candidate.semantic_correct > best.semantic_correct:
+        return True
+
+    # Once a perturbation has beaten the base, use exact value count
+    # and then strict protocol count to break ties among specialists.
+    if (
+        best.seed is not None
+        and candidate.semantic_correct
+        == best.semantic_correct
+    ):
+        return (
+            candidate.value_correct,
+            candidate.strict_correct,
+        ) > (
+            best.value_correct,
+            best.strict_correct,
+        )
+
+    return False
 
 
 def search_candidates(
@@ -329,51 +400,51 @@ def search_candidates(
     )
     print_score(base_score)
 
-    # The base starts as the winner.
     best_score = base_score
 
     for scale in SCALES:
-        print(f"\n  Testing scale {scale:.3f}")
+        print(f"\n  Testing scale {scale:g}")
 
-        for seed in range(NUM_SEEDS_PER_SCALE):
-            candidate_score = evaluate_seed(
+        for seed in DIRECTION_SEEDS:
+            candidate_score = evaluate_direction(
                 model,
                 dev_tasks,
                 seed=seed,
                 scale=scale,
             )
-
-            changed = count_changed_answers(
+            answer_changes = count_changed_answers(
                 dev_tasks,
+                base_score,
+                candidate_score,
+            )
+            text_changes = count_changed_predictions(
                 base_score,
                 candidate_score,
             )
 
             print_score(
                 candidate_score,
-                changed=changed,
+                answer_changes=answer_changes,
+                text_changes=text_changes,
             )
 
-            # A perturbation must strictly beat the
-            # current winner.
-            if (
-                candidate_score.correct
-                > best_score.correct
+            if _candidate_is_better(
+                candidate_score,
+                best_score,
             ):
                 best_score = candidate_score
                 print("    New best candidate")
 
     if best_score.seed is None:
         print(
-            f"\n  No {family} perturbation "
-            "beat the base."
+            f"\n  No {family} direction "
+            "beat the base semantically."
         )
     else:
         print(
             f"\n  Selected {family} "
             f"{best_score.label}"
         )
-
         print_answer_changes(
             dev_tasks,
             base_score,
@@ -392,7 +463,6 @@ def evaluate_base_only(
         f"\nEvaluating {family} base only; "
         "perturbation search is disabled"
     )
-
     base_score = evaluate_current_model(
         model,
         dev_tasks,
@@ -401,7 +471,6 @@ def evaluate_base_only(
         show_details=True,
     )
     print_score(base_score)
-
     return base_score, base_score
 
 
@@ -429,22 +498,22 @@ def select_or_use_base(
 def evaluate_selected_model(
     model: BaseModel,
     tasks: tuple[AtomicTask, ...],
-    selected_score: CandidateScore,
-    base_test_score: CandidateScore,
+    selected_dev: CandidateScore,
+    base_test: CandidateScore,
 ) -> CandidateScore:
-    if selected_score.seed is None:
-        return base_test_score
+    if selected_dev.seed is None:
+        return base_test
 
-    if selected_score.scale is None:
+    if selected_dev.scale is None:
         raise RuntimeError(
             "selected perturbation has no scale"
         )
 
-    return evaluate_seed(
+    return evaluate_direction(
         model,
         tasks,
-        seed=selected_score.seed,
-        scale=selected_score.scale,
+        seed=selected_dev.seed,
+        scale=selected_dev.scale,
     )
 
 
@@ -457,16 +526,65 @@ def print_final_result(
 ) -> None:
     print(
         f"  {family} {selected_dev.label}: "
-        f"dev {base_dev.accuracy:.1%} "
-        f"-> {selected_dev.accuracy:.1%}, "
-        f"test {base_test.accuracy:.1%} "
-        f"-> {selected_test.accuracy:.1%}"
+        "semantic dev "
+        f"{base_dev.semantic_accuracy:.1%} -> "
+        f"{selected_dev.semantic_accuracy:.1%}, "
+        "semantic test "
+        f"{base_test.semantic_accuracy:.1%} -> "
+        f"{selected_test.semantic_accuracy:.1%}"
     )
+    print(
+        "    strict dev "
+        f"{base_dev.strict_accuracy:.1%} -> "
+        f"{selected_dev.strict_accuracy:.1%}, "
+        "strict test "
+        f"{base_test.strict_accuracy:.1%} -> "
+        f"{selected_test.strict_accuracy:.1%}"
+    )
+
+
+def score_summary(
+    score: CandidateScore,
+) -> dict[str, int | float]:
+    return {
+        "semantic_correct": score.semantic_correct,
+        "value_correct": score.value_correct,
+        "strict_correct": score.strict_correct,
+        "format_valid": score.format_valid,
+        "total": score.total,
+        "semantic_accuracy": score.semantic_accuracy,
+        "value_accuracy": score.value_accuracy,
+        "strict_accuracy": score.strict_accuracy,
+    }
 
 
 def main() -> None:
     print("Loading the base model")
     model = BaseModel()
+
+    example_config = PerturbationConfig(
+        layer_indices=LAYER_INDICES,
+        module_paths=MODULE_PATHS,
+        rank=RANK,
+        scale=SCALES[0],
+        seed=DIRECTION_SEEDS[0],
+    )
+    example_perturbation = LocalPerturbation(
+        model,
+        example_config,
+    )
+    resolved_layer_indices = (
+        example_perturbation.layer_indices
+    )
+
+    print(
+        "Perturbing layers:",
+        resolved_layer_indices,
+    )
+    print(
+        "Matrices per layer:",
+        len(MODULE_PATHS),
+    )
 
     math_base_dev, math_best_dev = select_or_use_base(
         model,
@@ -474,7 +592,6 @@ def main() -> None:
         MATH_DEV_TASKS,
         search_enabled=SEARCH_MATH,
     )
-
     code_base_dev, code_best_dev = select_or_use_base(
         model,
         "code",
@@ -483,7 +600,6 @@ def main() -> None:
     )
 
     print("\nEvaluating math test tasks")
-
     math_base_test = evaluate_current_model(
         model,
         MATH_TEST_TASKS,
@@ -491,7 +607,6 @@ def main() -> None:
         scale=None,
         show_details=True,
     )
-
     math_selected_test = evaluate_selected_model(
         model,
         MATH_TEST_TASKS,
@@ -500,7 +615,6 @@ def main() -> None:
     )
 
     print("\nEvaluating code test tasks")
-
     code_base_test = evaluate_current_model(
         model,
         CODE_TEST_TASKS,
@@ -508,7 +622,6 @@ def main() -> None:
         scale=None,
         show_details=True,
     )
-
     code_selected_test = evaluate_selected_model(
         model,
         CODE_TEST_TASKS,
@@ -517,7 +630,6 @@ def main() -> None:
     )
 
     print("\nFinal selection")
-
     print_final_result(
         "math",
         math_base_dev,
@@ -525,7 +637,6 @@ def main() -> None:
         math_base_test,
         math_selected_test,
     )
-
     print_final_result(
         "code",
         code_base_dev,
@@ -536,48 +647,61 @@ def main() -> None:
 
     results = {
         "task_suite": TASK_SUITE_VERSION,
-        "layer_index": LAYER_INDEX,
-        "rank": RANK,
-        "scales_searched": list(SCALES),
-        "seeds_per_scale": NUM_SEEDS_PER_SCALE,
+        "selection_metric": "semantic_accuracy",
+        "perturbation": {
+            "normalization": "relative_frobenius",
+            "layer_indices": list(
+                resolved_layer_indices
+            ),
+            "module_paths": list(MODULE_PATHS),
+            "rank": RANK,
+            "scales_searched": list(SCALES),
+            "direction_seeds": list(
+                DIRECTION_SEEDS
+            ),
+        },
         "math_search_enabled": SEARCH_MATH,
         "code_search_enabled": SEARCH_CODE,
         "math": {
             "selected_seed": math_best_dev.seed,
             "selected_scale": math_best_dev.scale,
-            "base_dev_accuracy": (
-                math_base_dev.accuracy
+            "base_dev": score_summary(
+                math_base_dev
             ),
-            "selected_dev_accuracy": (
-                math_best_dev.accuracy
+            "selected_dev": score_summary(
+                math_best_dev
             ),
-            "base_test_accuracy": (
-                math_base_test.accuracy
+            "base_test": score_summary(
+                math_base_test
             ),
-            "selected_test_accuracy": (
-                math_selected_test.accuracy
+            "selected_test": score_summary(
+                math_selected_test
             ),
         },
         "code": {
             "selected_seed": code_best_dev.seed,
             "selected_scale": code_best_dev.scale,
-            "base_dev_accuracy": (
-                code_base_dev.accuracy
+            "base_dev": score_summary(
+                code_base_dev
             ),
-            "selected_dev_accuracy": (
-                code_best_dev.accuracy
+            "selected_dev": score_summary(
+                code_best_dev
             ),
-            "base_test_accuracy": (
-                code_base_test.accuracy
+            "base_test": score_summary(
+                code_base_test
             ),
-            "selected_test_accuracy": (
-                code_selected_test.accuracy
+            "selected_test": score_summary(
+                code_selected_test
             ),
         },
     }
 
-    with open(
-        "selected_specialists.json",
+    RESULTS_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with RESULTS_PATH.open(
         "w",
         encoding="utf-8",
     ) as file:
@@ -587,7 +711,7 @@ def main() -> None:
             indent=2,
         )
 
-    print("\nSaved selected_specialists.json")
+    print(f"\nSaved {RESULTS_PATH}")
 
 
 if __name__ == "__main__":
