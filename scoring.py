@@ -10,20 +10,33 @@ ANSWER_TAG = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Punctuation that trails a word separator belongs to the separator,
+# not to the answer. Without this, "the result is: [0, 2, 4, 6]" yields
+# the value ": [0, 2, 4, 6]", which no longer parses as a list literal,
+# so a correct answer is scored as wrong.
+VALUE_SEPARATOR = r"\s*[:=]?\s*"
+
 CONCLUSION_PATTERNS = (
     re.compile(
         r"(?:the\s+)?(?:final\s+)?"
         r"(?:answer|result)"
         r"(?:\s+of\s+the\s+expression)?"
-        r"\s*(?:is|=|:)\s*([^\r\n]+)",
+        # \bis\b keeps "result island" from separating on "is".
+        r"(?:\s*\bis\b|\s*[:=])"
+        + VALUE_SEPARATOR
+        + r"([^\r\n]+)",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bevaluates\s+to\s+([^\r\n]+)",
+        r"\bevaluates\s+to\b"
+        + VALUE_SEPARATOR
+        + r"([^\r\n]+)",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bresulting\s+in\s+([^\r\n]+)",
+        r"\bresulting\s+in\b"
+        + VALUE_SEPARATOR
+        + r"([^\r\n]+)",
         re.IGNORECASE,
     ),
 )
@@ -472,6 +485,52 @@ def main() -> None:
             "code",
             "mixxissippi",
             'The final result is "mixixippi".',
+            False,
+            False,
+        ),
+        # The base model writes "is:" often enough that treating the
+        # colon as part of the value silently failed correct answers.
+        (
+            "colon after the word separator",
+            "code",
+            "[0, 2, 4, 6]",
+            "Reasoning happened.\nSo the result is: "
+            "[0, 2, 4, 6]",
+            False,
+            True,
+        ),
+        (
+            "colon after evaluates to",
+            "code",
+            "icke",
+            'Reasoning happened.\nThe expression '
+            'evaluates to: "icke"',
+            False,
+            True,
+        ),
+        (
+            "bare colon separator",
+            "code",
+            "HELLO",
+            "Reasoning happened.\nThe final answer: HELLO",
+            False,
+            True,
+        ),
+        (
+            "is inside a longer word is not a separator",
+            "code",
+            "[1, 2]",
+            "The result island was ignored.\n"
+            "The answer is [1, 2]",
+            False,
+            True,
+        ),
+        (
+            "colon does not rescue a wrong value",
+            "code",
+            "[0, 2, 4, 6]",
+            "Reasoning happened.\nSo the result is: "
+            "[0, 2, 4, 8]",
             False,
             False,
         ),

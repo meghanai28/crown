@@ -202,8 +202,10 @@ def print_answer_changes(
     tasks: tuple[AtomicTask, ...],
     base_score: CandidateScore,
     candidate_score: CandidateScore,
+    *,
+    header: str = "Extracted answers changed by winner:",
 ) -> None:
-    print("\n  Extracted answers changed by winner:")
+    print(f"\n  {header}")
     found_change = False
 
     for task, base_result, candidate_result in zip(
@@ -230,6 +232,75 @@ def print_answer_changes(
 
     if not found_change:
         print("    none")
+
+
+def print_transitions(
+    tasks: tuple[AtomicTask, ...],
+    base_score: CandidateScore,
+    candidate_score: CandidateScore,
+    *,
+    header: str,
+) -> None:
+    """Show which items changed correctness, not just how many.
+
+    Two runs can post the same score while disagreeing on which items
+    they solve. Without this, an unchanged total looks like an
+    unchanged model.
+    """
+
+    print(f"\n  {header}")
+    gains = 0
+    losses = 0
+
+    for task, base_result, candidate_result in zip(
+        tasks,
+        base_score.results,
+        candidate_score.results,
+    ):
+        if (
+            base_result.semantic_correct
+            == candidate_result.semantic_correct
+        ):
+            continue
+
+        if candidate_result.semantic_correct:
+            gains += 1
+            transition = "FAIL -> PASS"
+        else:
+            losses += 1
+            transition = "PASS -> FAIL"
+
+        print(f"    {task.task_id}: {transition}")
+        print(
+            "      expected:  "
+            f"{task.expected_answer!r}"
+        )
+        print(
+            "      base:      "
+            f"{base_result.extracted_answer!r}"
+        )
+        print(
+            "      candidate: "
+            f"{candidate_result.extracted_answer!r}"
+        )
+
+    if not gains and not losses:
+        print("    no item changed correctness")
+
+    agreed = sum(
+        base_result.semantic_correct
+        and candidate_result.semantic_correct
+        for base_result, candidate_result in zip(
+            base_score.results,
+            candidate_score.results,
+        )
+    )
+
+    print(
+        f"    gains {gains}, losses {losses}, "
+        f"net {gains - losses:+d}; "
+        f"{agreed}/{base_score.total} solved by both"
+    )
 
 
 def evaluate_current_model(
@@ -304,6 +375,7 @@ def evaluate_direction(
     *,
     seed: int,
     scale: float,
+    show_details: bool = False,
 ) -> CandidateScore:
     config = PerturbationConfig(
         layer_indices=LAYER_INDICES,
@@ -323,7 +395,7 @@ def evaluate_direction(
             tasks,
             seed=seed,
             scale=scale,
-            show_details=False,
+            show_details=show_details,
         )
 
 
@@ -509,12 +581,90 @@ def evaluate_selected_model(
             "selected perturbation has no scale"
         )
 
+    print(
+        "\n  Re-running the same held-out tasks under "
+        f"{selected_dev.label}"
+    )
+
     return evaluate_direction(
         model,
         tasks,
         seed=selected_dev.seed,
         scale=selected_dev.scale,
+        show_details=True,
     )
+
+
+def selection_outcome(
+    selected_dev: CandidateScore,
+    *,
+    search_enabled: bool,
+) -> str:
+    if not search_enabled:
+        return "search_disabled"
+
+    if selected_dev.seed is None:
+        return "no_direction_beat_base"
+
+    return "direction_selected"
+
+
+def evaluate_test_split(
+    model: BaseModel,
+    family: str,
+    test_tasks: tuple[AtomicTask, ...],
+    selected_dev: CandidateScore,
+) -> tuple[CandidateScore, CandidateScore]:
+    print(f"\nEvaluating {family} test tasks")
+
+    base_test = evaluate_current_model(
+        model,
+        test_tasks,
+        seed=None,
+        scale=None,
+        show_details=True,
+    )
+    print_score(base_test)
+
+    selected_test = evaluate_selected_model(
+        model,
+        test_tasks,
+        selected_dev,
+        base_test,
+    )
+
+    if selected_test is not base_test:
+        print_score(
+            selected_test,
+            answer_changes=count_changed_answers(
+                test_tasks,
+                base_test,
+                selected_test,
+            ),
+            text_changes=count_changed_predictions(
+                base_test,
+                selected_test,
+            ),
+        )
+        print_transitions(
+            test_tasks,
+            base_test,
+            selected_test,
+            header=(
+                "Held-out correctness transitions "
+                "(base -> selected):"
+            ),
+        )
+        print_answer_changes(
+            test_tasks,
+            base_test,
+            selected_test,
+            header=(
+                "Extracted answers changed on held-out tasks:"
+            ),
+        )
+
+    return base_test, selected_test
 
 
 def print_final_result(
@@ -523,30 +673,91 @@ def print_final_result(
     selected_dev: CandidateScore,
     base_test: CandidateScore,
     selected_test: CandidateScore,
+    *,
+    outcome: str,
 ) -> None:
+    # A base-only family has no before-and-after to report. Printing
+    # one anyway reads like a search that found nothing, which is a
+    # different and much stronger claim.
+    if outcome != "direction_selected":
+        reason = (
+            "no search was run"
+            if outcome == "search_disabled"
+            else (
+                f"{len(SCALES) * len(DIRECTION_SEEDS)} "
+                "directions searched, none beat the base on dev"
+            )
+        )
+        print(f"  {family}: {reason}; base model only")
+        print(
+            "    semantic dev "
+            f"{base_dev.semantic_accuracy:.1%}, test "
+            f"{base_test.semantic_accuracy:.1%}"
+        )
+        print(
+            "    strict   dev "
+            f"{base_dev.strict_accuracy:.1%}, test "
+            f"{base_test.strict_accuracy:.1%}"
+        )
+        return
+
     print(
-        f"  {family} {selected_dev.label}: "
-        "semantic dev "
+        f"  {family} {selected_dev.label} "
+        f"(best of {len(SCALES) * len(DIRECTION_SEEDS)}):"
+    )
+    print(
+        "    semantic dev "
         f"{base_dev.semantic_accuracy:.1%} -> "
-        f"{selected_dev.semantic_accuracy:.1%}, "
-        "semantic test "
+        f"{selected_dev.semantic_accuracy:.1%}, test "
         f"{base_test.semantic_accuracy:.1%} -> "
         f"{selected_test.semantic_accuracy:.1%}"
     )
     print(
-        "    strict dev "
+        "    strict   dev "
         f"{base_dev.strict_accuracy:.1%} -> "
-        f"{selected_dev.strict_accuracy:.1%}, "
-        "strict test "
+        f"{selected_dev.strict_accuracy:.1%}, test "
         f"{base_test.strict_accuracy:.1%} -> "
         f"{selected_test.strict_accuracy:.1%}"
     )
+    print(
+        "    dev is the selection set and is biased upward by "
+        "the search; only the test column is unbiased."
+    )
+
+
+def per_task_records(
+    tasks: tuple[AtomicTask, ...],
+    score: CandidateScore,
+) -> list[dict[str, object]]:
+    """Keep the evidence behind each total for later analysis."""
+
+    return [
+        {
+            "task_id": task.task_id,
+            "category": task.category,
+            "expected": task.expected_answer,
+            "extracted": result.extracted_answer,
+            "source": result.source,
+            "format_valid": result.format_valid,
+            "value_correct": result.value_correct,
+            "semantic_correct": result.semantic_correct,
+            "strict_correct": result.strict_correct,
+            "prediction": prediction,
+        }
+        for task, result, prediction in zip(
+            tasks,
+            score.results,
+            score.predictions,
+        )
+    ]
 
 
 def score_summary(
     score: CandidateScore,
-) -> dict[str, int | float]:
+    tasks: tuple[AtomicTask, ...],
+) -> dict[str, object]:
     return {
+        "tasks": per_task_records(tasks, score),
         "semantic_correct": score.semantic_correct,
         "value_correct": score.value_correct,
         "strict_correct": score.strict_correct,
@@ -599,34 +810,26 @@ def main() -> None:
         search_enabled=SEARCH_CODE,
     )
 
-    print("\nEvaluating math test tasks")
-    math_base_test = evaluate_current_model(
+    math_base_test, math_selected_test = evaluate_test_split(
         model,
-        MATH_TEST_TASKS,
-        seed=None,
-        scale=None,
-        show_details=True,
-    )
-    math_selected_test = evaluate_selected_model(
-        model,
+        "math",
         MATH_TEST_TASKS,
         math_best_dev,
-        math_base_test,
     )
-
-    print("\nEvaluating code test tasks")
-    code_base_test = evaluate_current_model(
+    code_base_test, code_selected_test = evaluate_test_split(
         model,
-        CODE_TEST_TASKS,
-        seed=None,
-        scale=None,
-        show_details=True,
-    )
-    code_selected_test = evaluate_selected_model(
-        model,
+        "code",
         CODE_TEST_TASKS,
         code_best_dev,
-        code_base_test,
+    )
+
+    math_outcome = selection_outcome(
+        math_best_dev,
+        search_enabled=SEARCH_MATH,
+    )
+    code_outcome = selection_outcome(
+        code_best_dev,
+        search_enabled=SEARCH_CODE,
     )
 
     print("\nFinal selection")
@@ -636,6 +839,7 @@ def main() -> None:
         math_best_dev,
         math_base_test,
         math_selected_test,
+        outcome=math_outcome,
     )
     print_final_result(
         "code",
@@ -643,6 +847,7 @@ def main() -> None:
         code_best_dev,
         code_base_test,
         code_selected_test,
+        outcome=code_outcome,
     )
 
     results = {
@@ -663,35 +868,45 @@ def main() -> None:
         "math_search_enabled": SEARCH_MATH,
         "code_search_enabled": SEARCH_CODE,
         "math": {
+            "outcome": math_outcome,
             "selected_seed": math_best_dev.seed,
             "selected_scale": math_best_dev.scale,
             "base_dev": score_summary(
-                math_base_dev
+                math_base_dev,
+                MATH_DEV_TASKS,
             ),
             "selected_dev": score_summary(
-                math_best_dev
+                math_best_dev,
+                MATH_DEV_TASKS,
             ),
             "base_test": score_summary(
-                math_base_test
+                math_base_test,
+                MATH_TEST_TASKS,
             ),
             "selected_test": score_summary(
-                math_selected_test
+                math_selected_test,
+                MATH_TEST_TASKS,
             ),
         },
         "code": {
+            "outcome": code_outcome,
             "selected_seed": code_best_dev.seed,
             "selected_scale": code_best_dev.scale,
             "base_dev": score_summary(
-                code_base_dev
+                code_base_dev,
+                CODE_DEV_TASKS,
             ),
             "selected_dev": score_summary(
-                code_best_dev
+                code_best_dev,
+                CODE_DEV_TASKS,
             ),
             "base_test": score_summary(
-                code_base_test
+                code_base_test,
+                CODE_TEST_TASKS,
             ),
             "selected_test": score_summary(
-                code_selected_test
+                code_selected_test,
+                CODE_TEST_TASKS,
             ),
         },
     }

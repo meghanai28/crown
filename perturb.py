@@ -4,7 +4,7 @@ import hashlib
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Sequence
+from typing import Iterator, Protocol, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -44,6 +44,14 @@ class PerturbationConfig:
     rank: int = 4
     scale: float = 0.01
     seed: int = 0
+
+    # Fraction of the update's energy drawn inside a structured
+    # subspace; the remainder stays isotropic. 0.0 reproduces the
+    # original random-direction baseline and is the control arm.
+    # A soft prior is used rather than hard projection because a
+    # subspace estimated from one checkpoint is noisy, and hard
+    # projection throws away every direction it failed to capture.
+    subspace_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if self.layer_indices is not None:
@@ -98,6 +106,11 @@ class PerturbationConfig:
         if self.seed < 0:
             raise ValueError("seed cannot be negative")
 
+        if not 0.0 <= self.subspace_weight <= 1.0:
+            raise ValueError(
+                "subspace_weight must lie in [0, 1]"
+            )
+
 
 # Computing the norm of a quantized matrix requires temporarily
 # dequantizing it. Cache the resulting scalar so a scale sweep only
@@ -145,6 +158,26 @@ def _dequantized_weight(
         layer.scales,
         layer.biases,
         **options,
+    )
+
+
+def dequantized_weight(layer: nn.Module) -> mx.array:
+    """Public view of a target matrix, shaped (output, input)."""
+
+    return _dequantized_weight(layer)
+
+
+def _factored_frobenius_norm(
+    a: mx.array,
+    b: mx.array,
+) -> mx.array:
+    """Norm of (a @ b) without materializing the dense product."""
+
+    return mx.sqrt(
+        mx.maximum(
+            mx.sum((a.T @ a) * (b @ b.T)),
+            1e-30,
+        )
     )
 
 
@@ -201,6 +234,8 @@ class NormalizedLowRankLinear(nn.Module):
         rank: int,
         scale: float,
         seed: int,
+        basis: tuple[mx.array, mx.array] | None = None,
+        subspace_weight: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -214,36 +249,91 @@ class NormalizedLowRankLinear(nn.Module):
                 "matrix dimension"
             )
 
+        if subspace_weight > 0.0 and basis is None:
+            raise ValueError(
+                "a positive subspace_weight needs a basis"
+            )
+
         self.base_layer = base_layer
         self.rank = rank
         self.scale = scale
         self.seed = seed
+        self.subspace_weight = subspace_weight
         self.input_dims = input_dims
         self.output_dims = output_dims
 
-        key_a = mx.random.key(seed)
-        key_b = mx.random.key(seed + 1)
+        keys = mx.random.split(
+            mx.random.key(seed),
+            4,
+        )
 
-        a = mx.random.normal(
-            shape=(input_dims, rank),
-            key=key_a,
-        ).astype(mx.float32)
-        b = mx.random.normal(
-            shape=(rank, output_dims),
-            key=key_b,
-        ).astype(mx.float32)
+        # Two independent rank-r updates are mixed by concatenating
+        # along the rank axis, because
+        #     [a1 | a2] @ [[b1], [b2]] == a1 @ b1 + a2 @ b2.
+        # Each part is first normalized to unit Frobenius norm and
+        # then weighted by sqrt, so subspace_weight is the fraction
+        # of the update's *energy* drawn inside the subspace.
+        parts_a: list[mx.array] = []
+        parts_b: list[mx.array] = []
+
+        isotropic_gain = math.sqrt(1.0 - subspace_weight)
+        subspace_gain = math.sqrt(subspace_weight)
+
+        if isotropic_gain > 0.0:
+            a_iso = mx.random.normal(
+                shape=(input_dims, rank),
+                key=keys[0],
+            ).astype(mx.float32)
+            b_iso = mx.random.normal(
+                shape=(rank, output_dims),
+                key=keys[1],
+            ).astype(mx.float32)
+            b_iso = b_iso * (
+                isotropic_gain
+                / _factored_frobenius_norm(a_iso, b_iso)
+            )
+            parts_a.append(a_iso)
+            parts_b.append(b_iso)
+
+        if subspace_gain > 0.0:
+            assert basis is not None
+            right_basis, left_basis = basis
+            basis_rank = right_basis.shape[1]
+
+            if rank > basis_rank:
+                raise ValueError(
+                    f"rank {rank} exceeds the basis rank "
+                    f"{basis_rank}"
+                )
+
+            # delta_W = U (Q^T P^T) V^T lies in the span of the
+            # basis on both sides, which is what restricts the
+            # sample to the subspace.
+            projector_p = mx.random.normal(
+                shape=(basis_rank, rank),
+                key=keys[2],
+            ).astype(mx.float32)
+            projector_q = mx.random.normal(
+                shape=(rank, basis_rank),
+                key=keys[3],
+            ).astype(mx.float32)
+
+            a_sub = right_basis.astype(mx.float32) @ projector_p
+            b_sub = projector_q @ left_basis.astype(mx.float32).T
+            b_sub = b_sub * (
+                subspace_gain
+                / _factored_frobenius_norm(a_sub, b_sub)
+            )
+            parts_a.append(a_sub)
+            parts_b.append(b_sub)
+
+        a = mx.concatenate(parts_a, axis=1)
+        b = mx.concatenate(parts_b, axis=0)
 
         # The effective update is (A @ B).T. Its Frobenius norm can
         # be calculated using only two rank-by-rank Gram matrices,
         # so we never materialize a huge dense delta_W matrix.
-        gram_a = a.T @ a
-        gram_b = b @ b.T
-        update_norm_squared = mx.sum(
-            gram_a * gram_b
-        )
-        update_norm = mx.sqrt(
-            mx.maximum(update_norm_squared, 1e-30)
-        )
+        update_norm = _factored_frobenius_norm(a, b)
         mx.eval(update_norm)
 
         raw_update_norm = float(
@@ -292,6 +382,22 @@ class NormalizedLowRankLinear(nn.Module):
         return base_output + perturbation
 
 
+class BasisProvider(Protocol):
+    """Supplies the (right, left) basis for one target matrix.
+
+    Implementations live in subspace.py. The call is expected to be
+    cached, because one density sweep installs the same matrices
+    hundreds of times.
+    """
+
+    def __call__(
+        self,
+        label: str,
+        base_layer: nn.Module,
+    ) -> tuple[mx.array, mx.array]:
+        ...
+
+
 @dataclass
 class _InstalledModule:
     parent: nn.Module
@@ -304,7 +410,7 @@ class _InstalledModule:
 def get_transformer_layers(
     base_model: BaseModel,
 ) -> Sequence[nn.Module]:
-    """Support both older and newer MLX-LM Llama layouts."""
+    """Support both older and newer MLX-LM decoder layouts."""
 
     model = base_model.model
 
@@ -321,6 +427,21 @@ def get_transformer_layers(
 
     raise AttributeError(
         "could not find transformer layers on the loaded model"
+    )
+
+
+def all_layer_indices(
+    base_model: BaseModel,
+) -> tuple[int, ...]:
+    """Every transformer layer.
+
+    The four-layer default explores a very small slice of the weight
+    space, which is a poor probe for any claim about how densely
+    useful models are packed around the base.
+    """
+
+    return tuple(
+        range(len(get_transformer_layers(base_model)))
     )
 
 
@@ -380,6 +501,7 @@ class LocalPerturbation:
         self,
         base_model: BaseModel,
         config: PerturbationConfig | None = None,
+        basis_provider: BasisProvider | None = None,
     ) -> None:
         self.base_model = base_model
         self.config = (
@@ -387,6 +509,16 @@ class LocalPerturbation:
             if config is None
             else config
         )
+        self.basis_provider = basis_provider
+
+        if (
+            self.config.subspace_weight > 0.0
+            and basis_provider is None
+        ):
+            raise ValueError(
+                "a positive subspace_weight needs a "
+                "basis_provider"
+            )
         self._installed: list[_InstalledModule] = []
         self._is_active = False
 
@@ -463,11 +595,29 @@ class LocalPerturbation:
                         layer_index,
                         module_path,
                     )
+                    label = (
+                        f"layers.{layer_index}."
+                        f"{module_path}"
+                    )
+                    basis = (
+                        None
+                        if self.basis_provider is None
+                        or self.config.subspace_weight
+                        <= 0.0
+                        else self.basis_provider(
+                            label,
+                            original,
+                        )
+                    )
                     wrapper = NormalizedLowRankLinear(
                         original,
                         rank=self.config.rank,
                         scale=self.config.scale,
                         seed=component_seed,
+                        basis=basis,
+                        subspace_weight=(
+                            self.config.subspace_weight
+                        ),
                     )
 
                     setattr(

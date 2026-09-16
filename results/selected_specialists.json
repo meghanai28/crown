@@ -1,0 +1,125 @@
+{
+  "task_suite": "crown_atomic_pilot_v2",
+  "selection_metric": "semantic_accuracy",
+  "perturbation": {
+    "normalization": "relative_frobenius",
+    "layer_indices": [
+      7,
+      14,
+      21,
+      27
+    ],
+    "module_paths": [
+      "self_attn.q_proj",
+      "self_attn.k_proj",
+      "self_attn.v_proj",
+      "self_attn.o_proj",
+      "mlp.gate_proj",
+      "mlp.up_proj",
+      "mlp.down_proj"
+    ],
+    "rank": 4,
+    "scales_searched": [
+      0.001,
+      0.003,
+      0.01,
+      0.03
+    ],
+    "direction_seeds": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "math_search_enabled": false,
+  "code_search_enabled": true,
+  "math": {
+    "selected_seed": null,
+    "selected_scale": null,
+    "base_dev": {
+      "semantic_correct": 14,
+      "value_correct": 14,
+      "strict_correct": 13,
+      "format_valid": 14,
+      "total": 16,
+      "semantic_accuracy": 0.875,
+      "value_accuracy": 0.875,
+      "strict_accuracy": 0.8125
+    },
+    "selected_dev": {
+      "semantic_correct": 14,
+      "value_correct": 14,
+      "strict_correct": 13,
+      "format_valid": 14,
+      "total": 16,
+      "semantic_accuracy": 0.875,
+      "value_accuracy": 0.875,
+      "strict_accuracy": 0.8125
+    },
+    "base_test": {
+      "semantic_correct": 14,
+      "value_correct": 14,
+      "strict_correct": 13,
+      "format_valid": 14,
+      "total": 16,
+      "semantic_accuracy": 0.875,
+      "value_accuracy": 0.875,
+      "strict_accuracy": 0.8125
+    },
+    "selected_test": {
+      "semantic_correct": 14,
+      "value_correct": 14,
+      "strict_correct": 13,
+      "format_valid": 14,
+      "total": 16,
+      "semantic_accuracy": 0.875,
+      "value_accuracy": 0.875,
+      "strict_accuracy": 0.8125
+    }
+  },
+  "code": {
+    "selected_seed": 2,
+    "selected_scale": 0.03,
+    "base_dev": {
+      "semantic_correct": 8,
+      "value_correct": 8,
+      "strict_correct": 8,
+      "format_valid": 11,
+      "total": 16,
+      "semantic_accuracy": 0.5,
+      "value_accuracy": 0.5,
+      "strict_accuracy": 0.5
+    },
+    "selected_dev": {
+      "semantic_correct": 11,
+      "value_correct": 11,
+      "strict_correct": 10,
+      "format_valid": 13,
+      "total": 16,
+      "semantic_accuracy": 0.6875,
+      "value_accuracy": 0.6875,
+      "strict_accuracy": 0.625
+    },
+    "base_test": {
+      "semantic_correct": 9,
+      "value_correct": 8,
+      "strict_correct": 7,
+      "format_valid": 13,
+      "total": 16,
+      "semantic_accuracy": 0.5625,
+      "value_accuracy": 0.5,
+      "strict_accuracy": 0.4375
+    },
+    "selected_test": {
+      "semantic_correct": 9,
+      "value_correct": 8,
+      "strict_correct": 7,
+      "format_valid": 11,
+      "total": 16,
+      "semantic_accuracy": 0.5625,
+      "value_accuracy": 0.5,
+      "strict_accuracy": 0.4375
+    }
+  }
+}

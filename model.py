@@ -13,7 +13,7 @@ class ModelConfig:
     """Everything needed to load and run the frozen base model."""
 
     model_id: str = (
-        "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        "mlx-community/Qwen2.5-7B-Instruct-4bit"
     )
     max_tokens: int = 256
 
@@ -149,6 +149,92 @@ class BaseModel:
         mx.eval(logits)
 
         return logits
+
+    def answer_logprob(
+        self,
+        user_prompt: str,
+        answer: str,
+        *,
+        system_prompt: str | None = None,
+        scaffold: str = "<answer>",
+    ) -> tuple[float, int]:
+        """Score the answer's tokens in a single forward pass.
+
+        The scaffold is teacher-forced rather than generated, so this
+        measures whether the model puts probability on the correct
+        value, not whether it remembered to emit the tag. That keeps
+        format compliance out of the objective, and it costs one
+        forward pass instead of a full decode.
+
+        Returns the mean log probability per answer token and the
+        number of tokens scored. The mean is comparable across tasks
+        whose answers differ in length.
+        """
+
+        if not answer.strip():
+            raise ValueError("answer cannot be empty")
+
+        formatted_prompt = self.format_prompt(
+            user_prompt,
+            system_prompt=system_prompt,
+        )
+        prefix_ids = self._encode_formatted_prompt(
+            formatted_prompt + scaffold
+        )
+
+        # The answer is tokenized on its own rather than as part of
+        # the joined string. Both Llama and Qwen BPE merge ">" with
+        # whatever follows it ("<answer>eura" tokenizes as
+        # [..., ">e", "ura"]), so joint tokenization would fold the
+        # closing bracket
+        # into the first scored token and quietly put the model's
+        # tag-emitting habit back into the objective. Encoding
+        # separately keeps the scored region exactly equal to the
+        # answer's characters for every task. The cost is a slightly
+        # off-distribution split, which is a constant per task and
+        # cancels when a perturbation is compared against the base.
+        answer_ids = list(
+            self.tokenizer.encode(
+                answer,
+                add_special_tokens=False,
+            )
+        )
+
+        if not answer_ids:
+            raise RuntimeError(
+                "the answer produced no tokens"
+            )
+
+        full_ids = prefix_ids + answer_ids
+        tokens = mx.array([full_ids])
+        logits = self.model(tokens)[0]
+
+        # Position i predicts token i + 1, so the first answer token
+        # is predicted by the last prefix position.
+        start = len(prefix_ids) - 1
+        answer_logits = logits[
+            start : start + len(answer_ids)
+        ].astype(mx.float32)
+
+        log_probs = answer_logits - mx.logsumexp(
+            answer_logits,
+            axis=-1,
+            keepdims=True,
+        )
+        targets = mx.array(answer_ids)[:, None]
+        chosen = mx.take_along_axis(
+            log_probs,
+            targets,
+            axis=-1,
+        )[:, 0]
+
+        total = mx.sum(chosen)
+        mx.eval(total)
+
+        return (
+            float(total.item()) / len(answer_ids),
+            len(answer_ids),
+        )
 
     def generate(
         self,
