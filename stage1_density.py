@@ -67,7 +67,7 @@ from tasks import (
 # differ in where they point and not in how hard they push.
 TARGET_KL = 0.05
 
-SAMPLES_PER_ARM = 10
+SAMPLES_PER_ARM = 100
 RANK = 16
 BASIS_RANK = 32
 
